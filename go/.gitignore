@@ -1,0 +1,19 @@
+# Binaries
+infra-tool
+*.exe
+*.out
+
+# Go build cache
+/bin/
+/build/
+
+# Go modules (optional depending on setup)
+go.sum
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
