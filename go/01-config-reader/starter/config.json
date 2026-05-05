@@ -1,0 +1,5 @@
+{
+  "service": "ad-ingestion",
+  "env": "dev",
+  "region": "us-west-1"
+}
