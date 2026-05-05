@@ -89,4 +89,3 @@ I simplified the implementation by:
 * removing state (keeping CLI stateless)
 * enforcing strict validation
 
-This aligns better with real infrastructure CLI design.
