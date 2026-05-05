@@ -73,7 +73,11 @@ error: cannot open file
 **Example invalid file:**
 
 ```json
-{ invalid json }
+{
+  "service": "ad-ingestion",
+  "env": "dev"
+  "region": "us-west-1"
+}
 ```
 
 **Command:**
