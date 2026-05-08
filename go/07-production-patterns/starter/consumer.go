@@ -4,13 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"kafka-integration/go/07-production_patterns/solution"
 	"log/slog"
 	"math"
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,93 +21,105 @@ type Event struct {
 	UserID int    `json:"user_id"`
 }
 
+const (
+	maxRetries              = 3
+	dbTimeout               = 2 * time.Second
+	initialBackoff          = 1 * time.Second
+	gracefulShutdownTimeout = 30 * time.Second
+)
+
+func insertEventWithRetry(ctx context.Context, db *sql.DB, logger *slog.Logger, event Event, payload []byte) error {
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		ctxWithTimeout, cancel := context.WithTimeout(ctx, dbTimeout)
+
+		_, err := db.ExecContext(ctxWithTimeout, "INSERT INTO events (type, payload) VALUES ($1, $2)",
+			event.Event, payload)
+		cancel()
+
+		if err == nil {
+			logger.Info("event stored", "event", event.Event, "user_id", event.UserID, "attempt", attempt)
+			return nil
+		}
+
+		logger.Error("insert failed", "error", err, "event", event.Event, "user_id", event.UserID, "attempt", attempt)
+
+		if attempt == maxRetries {
+			logger.Error("insert failed after all retries", "event", event.Event, "user_id", event.UserID, "max_attempts", maxRetries)
+			return err
+		}
+
+		backoffDuration := time.Duration(math.Pow(2, float64(attempt-1))) * initialBackoff
+		logger.Info("retrying insert", "event", event.Event, "user_id", event.UserID, "attempt", attempt, "backoff_ms", backoffDuration.Milliseconds())
+
+		time.Sleep(backoffDuration)
+	}
+
+	return nil
+}
+
 func main() {
 	logger := slog.Default()
-	cfg := solution.LoadConfig()
-
-	// Database
-	db, err := sql.Open("postgres", cfg.DatabaseURL)
+	db, err := sql.Open(
+		"postgres",
+		"host=localhost port=5432 user=postgres password=postgres dbname=eventsdb sslmode=disable",
+	)
 	if err != nil {
-		logger.Error("database error", "error", err)
-		os.Exit(1)
+		logger.Error("database unavailable", "error", err)
+		return
 	}
 	db.SetMaxOpenConns(5)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
+
 	defer db.Close()
 
 	logger.Info("database connected")
 
-	// Kafka reader
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     cfg.KafkaBrokers,
-		Topic:       cfg.KafkaTopic,
-		GroupID:     cfg.KafkaGroupID,
+		Brokers:     []string{"localhost:9092"},
+		Topic:       "ad-events",
+		GroupID:     "ad-consumer-group-v2",
 		StartOffset: kafka.FirstOffset,
 	})
 	defer reader.Close()
 
 	logger.Info("kafka reader initialized")
 
-	// DLQ writer
-	dlqWriter, err := solution.NewDLQWriter(cfg.KafkaBrokers, cfg.DLQTopic, logger)
-	if err != nil {
-		logger.Error("failed to create DLQ writer", "error", err)
-		os.Exit(1)
-	}
-	defer dlqWriter.Close()
-
-	// Signal handling
 	shutdownSignal := make(chan os.Signal, 1)
+
 	signal.Notify(shutdownSignal, syscall.SIGINT, syscall.SIGTERM)
 
 	var wg sync.WaitGroup
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	stopProcessing := make(chan struct{})
-	processed := &atomic.Int64{}
 
-	// Signal handler
 	go func() {
 		sig := <-shutdownSignal
 		logger.Info("shutdown signal received", "signal", sig.String())
+
+		// Signal main loop to stop accepting new messages
 		close(stopProcessing)
 	}()
 
-	// Consumer lag monitor
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				stats := reader.Stats()
-				logger.Info("consumer lag", "lag", stats.Lag, "processed", processed.Load())
-			}
-		}
-	}()
-
-	// Message processing loop
 	for {
 		select {
 		case <-stopProcessing:
-			logger.Info("waiting for in-flight messages")
+			logger.Info("stopping message processing, waiting for current message to finish")
 			wg.Wait()
+			logger.Info("all messages processed, starting graceful shutdown")
 			goto shutdown
 
 		default:
 			message, err := reader.FetchMessage(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
+					logger.Info("message fetch cancelled due to shutdown")
 					goto shutdown
 				}
-				if solution.IsTransientKafkaError(err) {
-					logger.Error("transient kafka error", "error", err)
-					time.Sleep(1 * time.Second)
-				}
+				logger.Error("failed to read message", "error", err)
 				continue
 			}
 
@@ -118,35 +128,33 @@ func main() {
 			var event Event
 			err = json.Unmarshal(message.Value, &event)
 			if err != nil {
-				logger.Error("invalid payload", "error", err)
-				dlqWriter.Send(ctx, message, message.Offset, "invalid_json")
+				logger.Error("invalid payload", "error", err, "payload", string(message.Value))
 				reader.CommitMessages(ctx, message)
 				wg.Done()
 				continue
 			}
 
-			// Insert with retry
-			err = insertWithRetry(ctx, db, logger, event, message.Value)
+			err = insertEventWithRetry(ctx, db, logger, event, message.Value)
 			if err != nil {
-				logger.Error("max retries exceeded, sending to DLQ", "offset", message.Offset)
-				dlqWriter.Send(ctx, message, message.Offset, "max_retries_exceeded")
+				logger.Error("skipping event after failed retries", "event", event.Event, "user_id", event.UserID, "offset", message.Offset)
 			}
 
-			reader.CommitMessages(ctx, message)
-			if err == nil {
-				processed.Add(1)
+			err = reader.CommitMessages(ctx, message)
+			if err != nil {
+				logger.Error("failed to commit message offset", "error", err, "offset", message.Offset)
 			}
 			wg.Done()
 		}
 	}
 
 shutdown:
-	logger.Info("graceful shutdown", "timeout_seconds", cfg.ShutdownTimeout.Seconds())
+	logger.Info("starting graceful shutdown", "timeout_seconds", gracefulShutdownTimeout.Seconds())
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
 	defer shutdownCancel()
 
 	shutdownDone := make(chan struct{})
+
 	go func() {
 		wg.Wait()
 		close(shutdownDone)
@@ -154,40 +162,24 @@ shutdown:
 
 	select {
 	case <-shutdownDone:
-		logger.Info("shutdown complete", "total_processed", processed.Load())
+		logger.Info("graceful shutdown completed successfully")
 	case <-shutdownCtx.Done():
-		logger.Error("shutdown timeout exceeded")
+		logger.Error("graceful shutdown timeout exceeded", "timeout_seconds", gracefulShutdownTimeout.Seconds())
 		os.Exit(1)
 	}
 
-	logger.Info("exiting")
-	os.Exit(0)
-}
-
-// insertWithRetry inserts event with exponential backoff
-func insertWithRetry(ctx context.Context, db *sql.DB, logger *slog.Logger, event Event, payload []byte) error {
-	for attempt := 1; attempt <= 3; attempt++ {
-		ctxWithTimeout, cancel := context.WithTimeout(ctx, 2*time.Second)
-
-		_, err := db.ExecContext(ctxWithTimeout, "INSERT INTO events (type, payload) VALUES ($1, $2)", event.Event, payload)
-		cancel()
-
-		if err == nil {
-			logger.Info("event stored", "event", event.Event, "user_id", event.UserID)
-			return nil
-		}
-
-		if !solution.IsTransientError(err) {
-			logger.Error("permanent error", "error", err)
-			return err
-		}
-
-		if attempt < 3 {
-			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
-			logger.Info("retrying", "attempt", attempt, "backoff_ms", backoff.Milliseconds())
-			time.Sleep(backoff)
-		}
+	if err := reader.Close(); err != nil {
+		logger.Error("error closing kafka reader", "error", err)
+	} else {
+		logger.Info("kafka reader closed")
 	}
 
-	return nil
+	if err := db.Close(); err != nil {
+		logger.Error("error closing database", "error", err)
+	} else {
+		logger.Info("database connection closed")
+	}
+
+	logger.Info("consumer shutdown complete, exiting")
+	os.Exit(0)
 }
