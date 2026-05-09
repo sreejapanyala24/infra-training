@@ -35,7 +35,7 @@ func LoadConfig() Config {
 		DatabaseURL:     dbURL,
 		KafkaBrokers:    strings.Split(kafkaBrokers, ","),
 		KafkaTopic:      "ad-events",
-		KafkaGroupID:    "ad-consumer-group-v3",
+		KafkaGroupID:    "ad-consumer-group-v5",
 		DLQTopic:        dlqTopic,
 		ShutdownTimeout: 5 * time.Second,
 	}

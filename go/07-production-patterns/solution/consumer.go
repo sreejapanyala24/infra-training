@@ -147,7 +147,8 @@ func main() {
 		logger.Info("parsed event", "event", event.Event, "user_id", event.UserID)
 
 		// Insert with retry - ONLY commit if success
-		insertErr := insertWithRetry(context.Background(), db, logger, event, message.Value)
+		//insertErr := insertWithRetry(context.Background(), db, logger, event, message.Value)
+		insertErr := insertWithRetry(context.Background(), db, logger, event, message.Value, message)
 
 		if insertErr != nil {
 			logger.Error("failed to insert, sending to DLQ", "offset", message.Offset, "error", insertErr)
@@ -188,13 +189,22 @@ func main() {
 	logger.Info("exiting")
 	os.Exit(0)
 }
-
-func insertWithRetry(ctx context.Context, db *sql.DB, logger *slog.Logger, event Event, payload []byte) error {
+func insertWithRetry(ctx context.Context, db *sql.DB, logger *slog.Logger, event Event, rawPayload []byte, message kafka.Message) error {
+	//func insertWithRetry(ctx context.Context, db *sql.DB, logger *slog.Logger, event Event, payload []byte) error {
 	var insertErr error
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		ctxWithTimeout, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, insertErr = db.ExecContext(ctxWithTimeout, "INSERT INTO events (type, payload) VALUES ($1, $2)", event.Event, payload)
+		//_, insertErr = //db.ExecContext(ctxWithTimeout, "INSERT INTO events (type, payload) VALUES ($1, $2)", event.Event, payload)
+		_, insertErr = db.ExecContext(ctxWithTimeout,
+			`INSERT INTO events (type,payload,kafka_topic,kafka_partition,kafka_offset)VALUES ($1, $2, $3, $4, $5)ON CONFLICT (kafka_topic, kafka_partition, kafka_offset)DO NOTHING`,
+			event.Event,
+			string(rawPayload),
+			message.Topic,
+			message.Partition,
+			message.Offset,
+		)
+
 		cancel()
 
 		if insertErr == nil {
