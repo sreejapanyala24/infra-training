@@ -33,7 +33,7 @@ func main() {
 	})
 	defer writer.Close()
 
-	event := ProducerEvent{Event: "ad_click", UserID: 19}
+	event := ProducerEvent{Event: "ad_click", UserID: 41}
 	data, err := json.Marshal(event)
 	if err != nil {
 		logger.Error("failed to marshal", "error", err)

@@ -19,17 +19,22 @@ Run the project:
 ## Architecture
 
 ```text
-Kafka → Go Consumer → Postgres
+Producer → Kafka (ad-events) → Go Consumer → Postgres
+                               ↓
+                         Dead Letter Queue
+                           (ad-events-dlq)
 ```
 
-Kafka events are consumed and stored into Postgres with production-safe handling.
+Kafka events are consumed safely and stored into Postgres with retry handling, DLQ support, and idempotent processing.
 
 ---
 
 ## Expected Output
 
+Producer logs:
+
 ```text
-event sent
+event sent successfully
 ```
 
 Consumer logs:
@@ -37,7 +42,11 @@ Consumer logs:
 ```text
 database connected
 kafka reader initialized
-event stored
+kafka DLQ writer initialized
+processing message offset=0
+parsed event event=ad_click user_id=32
+event inserted event=ad_click attempt=1
+committed message offset=0
 ```
 
 ---
@@ -46,17 +55,25 @@ event stored
 
 Check inserted rows:
 
-```sql
-SELECT * FROM events;
+```bash
+docker compose exec postgres psql -U postgres -d eventsdb -c "SELECT * FROM events;"
 ```
 
 Expected:
 
 ```text
- id |   type    |                payload
-----+-----------+----------------------------------
-  1 | ad_click  | {"event":"ad_click","user_id":2}
+ id |   type   |                payload                 | kafka_topic | kafka_partition | kafka_offset
+----+----------+----------------------------------------+--------------+----------------+--------------
+  1 | ad_click | {"event":"ad_click","user_id":32}     | ad-events    | 0              | 0
 ```
+
+The table uses Kafka metadata:
+
+```text
+(topic, partition, offset)
+```
+
+to prevent duplicate inserts during retries.
 
 ---
 
@@ -72,7 +89,7 @@ retrying insert
 insert failed after all retries
 ```
 
-Consumer retries safely before skipping the event.
+Consumer retries transient failures safely using exponential backoff before skipping the event or sending it to the DLQ.
 
 ---
 
@@ -81,10 +98,17 @@ Consumer retries safely before skipping the event.
 If Kafka contains invalid JSON:
 
 ```text
-invalid payload
+failed to parse event
+sending message to DLQ
 ```
 
-Consumer skips the message safely without crashing.
+Consumer redirects invalid messages safely to:
+
+```text
+ad-events-dlq
+```
+
+without crashing.
 
 ---
 
@@ -163,7 +187,7 @@ docker compose up -d postgres
 **Symptom:**
 
 ```text
-invalid payload
+failed to parse event
 ```
 
 **Debug:**
@@ -171,7 +195,7 @@ invalid payload
 Check consumer logs:
 
 ```bash
-cat starter/consumer.log
+cat consumer.log
 ```
 
 **Fix:**
@@ -187,6 +211,27 @@ Send valid JSON payloads only:
 
 ---
 
+### 4. Multiple Consumer Processes
+
+**Symptom:**
+
+Duplicate rows inserted into database.
+
+**Debug:**
+
+```bash
+ps aux | grep consumer
+```
+
+**Fix:**
+
+```bash
+pkill -f consumer
+```
+
+Ensure only one consumer process is running.
+
+---
 
 ## Claude Usage + Critique
 
